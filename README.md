@@ -2,7 +2,7 @@
 
 An enhanced multi-view extension for [SAM 3D Objects](https://github.com/facebookresearch/sam-3d-objects), featuring **adaptive fusion** strategies for improved 3D reconstruction quality from multiple viewpoints.
 
-> 🔗 **Basic Version**: For a simpler averaging-based approach, check out our [basic multi-view fork](https://github.com/YOUR_USERNAME/sam3d-objects-fork).
+> 🔗 **Basic Version**: For a simpler averaging-based approach, check out our [basic multi-view fork](https://github.com/devinli123/multi-view-sam-3d-objects).
 
 ## 🔥 Highlights
 
@@ -76,28 +76,14 @@ This is an **active research project**. We are continuously exploring new fusion
 
 ## Installation
 
-```bash
-git clone https://github.com/YOUR_USERNAME/MV-SAM3D.git
-cd MV-SAM3D
-pip install -r requirements.txt
-```
-
-For model checkpoints, please follow the setup instructions in [doc/setup.md](doc/setup.md).
+Please follow the installation instructions in the [basic multi-view version](https://github.com/devinli123/multi-view-sam-3d-objects) or in [SAM 3D Objects](https://github.com/facebookresearch/sam-3d-objects).
 
 ## Quick Start
 
-### Basic Multi-View Reconstruction (Simple Average)
-
-```bash
-python run_inference.py --input_path ./data --mask_prompt object_name
-```
-
-### Adaptive Multi-View Reconstruction (Recommended)
-
 ```bash
 python run_inference_weighted.py \
-    --input_path ./data \
-    --mask_prompt object_name \
+    --input_path ./data/example \
+    --mask_prompt stuffed_toy \
     --image_names 0,1,2,3,4,5
 ```
 
@@ -108,8 +94,8 @@ python run_inference_weighted.py \
 | `--input_path` | Path to input directory | Required |
 | `--mask_prompt` | Mask folder name | None |
 | `--image_names` | Image names (comma-separated) | All images |
-| `--entropy_alpha` | Fusion sharpness (higher = more selective) | 5.0 |
-| `--no_weighting` | Disable adaptive fusion | False |
+| `--entropy_alpha` | Fusion sharpness (higher = more selective) | 30.0 |
+| `--no_weighting` | Disable adaptive fusion (use simple average) | False |
 | `--visualize_weights` | Visualize fusion weights | False |
 
 ### Data Structure
@@ -128,32 +114,10 @@ input_path/
 
 **Mask Format**: RGBA format where alpha channel stores mask (alpha=255 for object, alpha=0 for background).
 
-## Roadmap
-
-- [x] Basic multi-view fusion (averaging)
-- [x] Adaptive confidence-based fusion
-- [ ] More sophisticated confidence estimation
-- [ ] Support for additional input modalities
-- [ ] Quantitative evaluation on benchmarks
-
-## Citation
-
-If you find this work useful, please consider citing:
-
-```bibtex
-@misc{mv-sam3d,
-  author = {Your Name},
-  title = {MV-SAM3D: Adaptive Multi-View 3D Reconstruction},
-  year = {2024},
-  publisher = {GitHub},
-  url = {https://github.com/YOUR_USERNAME/MV-SAM3D}
-}
-```
-
 ## Acknowledgments
 
 This project builds upon [SAM 3D Objects](https://github.com/facebookresearch/sam-3d-objects) by Meta. We thank the original authors for their excellent work.
 
 ## License
 
-This project is licensed under the [SAM License](./LICENSE).
+This project inherits the [SAM License](./LICENSE) from the original SAM 3D Objects project.
