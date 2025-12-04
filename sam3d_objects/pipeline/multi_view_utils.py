@@ -23,7 +23,6 @@ def inject_generator_multi_view(
     num_steps: int,
     mode: Literal['stochastic', 'multidiffusion'] = 'multidiffusion',
     attention_logger=None,
-    optimize_per_view_pose: bool = False,
 ):
     """
     Inject multi-view support into generator.
@@ -33,30 +32,17 @@ def inject_generator_multi_view(
         num_views: Number of views
         num_steps: Number of inference steps
         mode: 'stochastic' or 'multidiffusion'
-        optimize_per_view_pose: If True, each view maintains and iterates its own pose.
-                               If False (default), only View 0's pose is used.
     
     Yields:
-        dict with 'per_view_x_t' if optimize_per_view_pose is True, else None
+        None (kept for API compatibility)
         
     Multi-view Iteration Strategy:
     ------------------------------
-    
-    Default mode (optimize_per_view_pose=False):
-        - Shape: 所有视角的 velocity 取平均后更新
-        - Pose: 只用 View 0 的 velocity 更新（其他视角的 pose velocity 被忽略）
-        - 输出: shape + View 0 的 pose
-    
-    Per-view pose mode (optimize_per_view_pose=True):
-        - Shape: 所有视角的 velocity 取平均后更新（与默认模式相同）
-        - Pose: 每个视角维护自己的 pose 状态，用自己的 velocity 更新
-        - 输出: shape + 所有视角的 pose（用于多视角一致性分析）
+    - Shape: All views' velocity averaged for update
+    - Pose: Only View 0's velocity is used (other views' pose velocity ignored)
+    - Output: shape + View 0's pose
     """
-    # 存储每个视角的状态（仅在 optimize_per_view_pose=True 时使用）
-    all_view_states_storage = {
-        'per_view_x_t': None,  # List of x_t for each view
-        'step_count': 0,
-    } if optimize_per_view_pose else None
+    all_view_states_storage = None
     
     original_dynamics = generator._generate_dynamics
     
@@ -140,127 +126,50 @@ def inject_generator_multi_view(
                 logger.warning(f"Condition tokens not organized by views, using same condition for all views")
                 view_conditions = [cond_tokens] * num_views
             
-            # ========================================
-            # Per-view pose 模式
-            # ========================================
-            if optimize_per_view_pose and all_view_states_storage is not None:
-                step = all_view_states_storage['step_count']
-                
-                # 第一步：初始化每个视角的状态
-                if all_view_states_storage['per_view_x_t'] is None:
-                    all_view_states_storage['per_view_x_t'] = []
-                    for i in range(num_views):
-                        if isinstance(x_t, dict):
-                            view_x_t = {k: v.clone() for k, v in x_t.items()}
-                        else:
-                            view_x_t = x_t.clone()
-                        all_view_states_storage['per_view_x_t'].append(view_x_t)
-                    logger.info(f"[Multidiffusion] Per-view pose mode: initialized {num_views} view states")
-                
-                # 用每个视角自己的状态进行预测
-                preds = []
-                for view_idx in range(num_views):
-                    view_cond = view_conditions[view_idx]
-                    view_x_t = all_view_states_storage['per_view_x_t'][view_idx]
-                    
-                    if cond_idx < len(args_conditionals):
-                        new_args = args_conditionals[:cond_idx] + (view_cond,) + args_conditionals[cond_idx+1:]
-                    else:
-                        new_args = args_conditionals + (view_cond,)
-                    
-                    if attention_logger is not None:
-                        attention_logger.set_view(view_idx)
-                    
-                    pred = original_dynamics(view_x_t, t, *new_args, **kwargs_conditionals)
-                    preds.append(pred)
-                
-                # 更新每个视角的状态
-                if isinstance(preds[0], dict):
-                    # 1. 计算 shape 的平均 velocity，更新 View 0 的 shape
-                    view0_x_t = all_view_states_storage['per_view_x_t'][0]
-                    for key in preds[0].keys():
-                        if key not in POSE_KEYS:
-                            stacked = torch.stack([p[key] for p in preds])
-                            avg_velocity = stacked.mean(dim=0)
-                            view0_x_t[key] = view0_x_t[key] + avg_velocity * dt
-                    
-                    # 2. 同步 shape 到所有其他视角
-                    for view_idx in range(1, num_views):
-                        view_x_t = all_view_states_storage['per_view_x_t'][view_idx]
-                        for key in preds[0].keys():
-                            if key not in POSE_KEYS:
-                                view_x_t[key] = view0_x_t[key].clone()
-                    
-                    # 3. 每个视角独立更新自己的 pose
-                    for view_idx in range(num_views):
-                        view_x_t = all_view_states_storage['per_view_x_t'][view_idx]
-                        for key in preds[view_idx].keys():
-                            if key in POSE_KEYS:
-                                view_x_t[key] = view_x_t[key] + preds[view_idx][key] * dt
-                
-                all_view_states_storage['step_count'] += 1
-                
-                # 返回 fused velocity 给 solver
-                # Shape: 平均 velocity
-                # Pose: View 0 的 velocity（solver 会用这个更新它的 x_t）
-                if isinstance(preds[0], dict):
-                    fused_pred = {}
-                    for key in preds[0].keys():
-                        if key in POSE_KEYS:
-                            fused_pred[key] = preds[0][key]
-                        else:
-                            stacked = torch.stack([p[key] for p in preds])
-                            fused_pred[key] = stacked.mean(dim=0)
-                    return fused_pred
+            # Fuse predictions from all views
+            # Shape: averaged, Pose: View 0 only
+            preds = []
+            for view_idx in range(num_views):
+                view_cond = view_conditions[view_idx]
+                if cond_idx < len(args_conditionals):
+                    new_args = args_conditionals[:cond_idx] + (view_cond,) + args_conditionals[cond_idx+1:]
                 else:
-                    return preds[0]
-                
-            # ========================================
-            # 默认模式：Shape 平均，Pose 只用 View 0
-            # ========================================
+                    new_args = args_conditionals + (view_cond,)
+                if attention_logger is not None:
+                    attention_logger.set_view(view_idx)
+                pred = original_dynamics(x_t, t, *new_args, **kwargs_conditionals)
+                preds.append(pred)
+            
+            # Log (only once)
+            if not hasattr(_new_dynamics_multidiffusion, '_logged_shape'):
+                if isinstance(x_t, dict):
+                    logger.info(f"[Multidiffusion] x_t keys: {list(x_t.keys())}")
+                if isinstance(preds[0], dict):
+                    logger.info(f"[Multidiffusion] pred keys: {list(preds[0].keys())}")
+                logger.info(f"[Multidiffusion] Default mode: Shape=avg, Pose=View0")
+                _new_dynamics_multidiffusion._logged_shape = True
+            
+            # Fuse predictions
+            if isinstance(preds[0], dict):
+                fused_pred = {}
+                for key in preds[0].keys():
+                    stacked = torch.stack([p[key] for p in preds])
+                    if key in POSE_KEYS:
+                        # Pose: View 0 only
+                        fused_pred[key] = preds[0][key]
+                    else:
+                        # Shape: average
+                        fused_pred[key] = stacked.mean(dim=0)
+                return fused_pred
+            elif isinstance(preds[0], (list, tuple)):
+                fused_pred = tuple(
+                    torch.stack([p[i] for p in preds]).mean(dim=0)
+                    for i in range(len(preds[0]))
+                )
+                return fused_pred
             else:
-                preds = []
-                for view_idx in range(num_views):
-                    view_cond = view_conditions[view_idx]
-                    if cond_idx < len(args_conditionals):
-                        new_args = args_conditionals[:cond_idx] + (view_cond,) + args_conditionals[cond_idx+1:]
-                    else:
-                        new_args = args_conditionals + (view_cond,)
-                    if attention_logger is not None:
-                        attention_logger.set_view(view_idx)
-                    pred = original_dynamics(x_t, t, *new_args, **kwargs_conditionals)
-                    preds.append(pred)
-                
-                # 日志（只打印一次）
-                if not hasattr(_new_dynamics_multidiffusion, '_logged_shape'):
-                    if isinstance(x_t, dict):
-                        logger.info(f"[Multidiffusion] x_t keys: {list(x_t.keys())}")
-                    if isinstance(preds[0], dict):
-                        logger.info(f"[Multidiffusion] pred keys: {list(preds[0].keys())}")
-                    logger.info(f"[Multidiffusion] Default mode: Shape=avg, Pose=View0")
-                    _new_dynamics_multidiffusion._logged_shape = True
-                
-                # 融合预测
-                if isinstance(preds[0], dict):
-                    fused_pred = {}
-                    for key in preds[0].keys():
-                        stacked = torch.stack([p[key] for p in preds])
-                        if key in POSE_KEYS:
-                            # Pose: 只用 View 0
-                            fused_pred[key] = preds[0][key]
-                        else:
-                            # Shape: 平均
-                            fused_pred[key] = stacked.mean(dim=0)
-                    return fused_pred
-                elif isinstance(preds[0], (list, tuple)):
-                    fused_pred = tuple(
-                        torch.stack([p[i] for p in preds]).mean(dim=0)
-                        for i in range(len(preds[0]))
-                    )
-                    return fused_pred
-                else:
-                    fused_pred = torch.stack(preds).mean(dim=0)
-                    return fused_pred
+                fused_pred = torch.stack(preds).mean(dim=0)
+                return fused_pred
         
         generator._generate_dynamics = _new_dynamics_multidiffusion
         

@@ -9,7 +9,6 @@ This document provides detailed documentation for all command-line parameters of
 - [Weighting Parameters](#weighting-parameters)
 - [Visualization Parameters](#visualization-parameters)
 - [DA3 Integration Parameters](#da3-integration-parameters)
-- [Camera Pose Estimation Parameters](#camera-pose-estimation-parameters)
 - [Usage Examples](#usage-examples)
 
 ---
@@ -248,91 +247,8 @@ This document provides detailed documentation for all command-line parameters of
 - **Default**: `False`
 - **Description**: Overlay SAM3D result on input point cloud for pose visualization.
   - Can be used with default MoGe depth maps or DA3 point clouds
-  - **Output**: `result_overlay.glb` (View 0) and `result_overlay_view{i}.glb` (each view, if `--estimate_camera_pose` enabled with mode `independent`)
+  - **Output**: `result_overlay.glb`
 - **Example**: `--overlay_pointmap`
-
----
-
-## Camera Pose Estimation Parameters
-
-### `--estimate_camera_pose`
-- **Type**: `flag`
-- **Default**: `False`
-- **Description**: Enable camera pose estimation.
-  
-  This feature is based on the following assumptions:
-  - Object is stationary in the real world
-  - View 0 camera coordinate system is defined as the world coordinate system
-  - By optimizing object pose for each view, we can derive camera position and orientation relative to the object
-
-  **Output files**:
-  - `estimated_poses.json`: Contains object pose and computed camera pose for each view
-  - `result_with_cameras.glb`: Visualization result including object and camera frustums
-  - `camera_pose_evaluation.json`: If DA3 GT poses are provided, includes evaluation metrics
-
-- **Example**: `--estimate_camera_pose`
-
-### `--pose_refine_steps`
-- **Type**: `int`
-- **Default**: `50`
-- **Description**: Number of pose optimization steps for each view in Stage 2。
-  - More steps may yield better pose estimation but take longer
-  - **Recommended range**: `50` - `200`
-- **Example**: `--pose_refine_steps 100`
-
-### `--camera_pose_mode`
-- **Type**: `str`
-- **Default**: `"fixed_shape"`
-- **Options**: `"fixed_shape"`, `"independent"`, `"manual_sync_time"`, `"mixed_update"`
-- **Description**: Camera pose estimation mode。Different modes have different shape and pose update strategies：
-
-#### 1. `fixed_shape` (Default)
-- **Description**: Fix multi-view fused shape from Stage 1, only optimize pose for each view
-- **Advantages**: 
-  - Ensure all views use unified shape
-  - Fast computation
-- **Disadvantages**: 
-  - May cause training distribution mismatch (network hasn't seen fixed final shape + pose starting from noise)
-- **Use case**: Quick testing, or when Stage 1 shape quality is high
-
-#### 2. `independent`
-- **Description**: Each view independently optimizes shape + pose (starting from noise)
-- **Advantages**:
-  - Each view's result is completely independent
-  - Matches single-view generation training distribution
-- **Disadvantages**:
-  - Does not leverage multi-view fusion advantages
-  - Shape may be inconsistent across views
-  - Pose may also be inconsistent
-- **Use case**: Comparison experiments or evaluating single-view generation quality
-
-#### 3. `manual_sync_time`
-- **Description**: Manually sync shape to same timestep as pose
-  - Pose iterates normally (using network-predicted velocity)
-  - Shape does not iterate, computed directly：`shape = shape_noise + k * xx_s`，where `xx_s = (shape_final - shape_noise) / n_steps`
-- **Advantages**:
-  - Keep shape and pose at same timestep (progress)
-  - Matches training distribution (both at same t)
-  - Final result strictly equals Stage 1 shape
-- **Disadvantages**: Shape doesn't use network prediction at all, may be less flexible
-- **Use case**: Scenarios requiring strict shape consistency
-
-#### 4. `mixed_update`
-- **Description**: Mixed update strategy (fixed increment version)
-  - Pose iterates normally (using network-predicted velocity)
-  - Shape uses mixed update：`shape_update = weight_network * v_network + weight_target * xx_s`
-  - `xx_s = (shape_final - shape_noise) / n_steps` is pre-computed fixed increment
-  - Weight linear transition: trust network early, lean towards target later
-  - Final step forced to target shape
-- **Advantages**:
-  - More stable strategy (target increment fixed)
-  - Respects network prediction (mainly uses network velocity early)
-  - Gradually guides to target (weight leans towards target later)
-  - Guarantees convergence (forced at final step)
-- **Disadvantages**: may be `manual_sync_time` slightly slower
-- **Use case**: Scenarios wanting to balance network prediction and target guidance
-
-- **Example**: `--camera_pose_mode manual_sync_time`
 
 ---
 
@@ -365,57 +281,6 @@ python run_inference_weighted.py \
     --da3_output ./da3_outputs/example/da3_output.npz \
     --overlay_pointmap \
     --merge_da3_glb
-```
-
-### Camera Pose Estimation (Basic Mode)
-```bash
-python run_inference_weighted.py \
-    --input_path ./data/example \
-    --mask_prompt stuffed_toy \
-    --image_names 0,1,2,3,4,5,6,7 \
-    --da3_output ./da3_outputs/example/da3_output.npz \
-    --estimate_camera_pose \
-    --camera_pose_mode fixed_shape
-```
-
-### Camera Pose Estimation (Manual Sync Mode)
-```bash
-python run_inference_weighted.py \
-    --input_path ./data/example \
-    --mask_prompt stuffed_toy \
-    --image_names 0,1,2,3,4,5,6,7 \
-    --da3_output ./da3_outputs/example/da3_output.npz \
-    --estimate_camera_pose \
-    --camera_pose_mode manual_sync_time \
-    --pose_refine_steps 100
-```
-
-### Camera Pose Estimation (Mixed Update Mode)
-```bash
-python run_inference_weighted.py \
-    --input_path ./data/example \
-    --mask_prompt stuffed_toy \
-    --image_names 0,1,2,3,4,5,6,7 \
-    --da3_output ./da3_outputs/example/da3_output.npz \
-    --estimate_camera_pose \
-    --camera_pose_mode mixed_update \
-    --pose_refine_steps 100
-```
-
-### Full Feature Example (with Evaluation and Visualization)
-```bash
-python run_inference_weighted.py \
-    --input_path ./data/example \
-    --mask_prompt stuffed_toy \
-    --image_names 0,1,2,3,4,5,6,7 \
-    --da3_output ./da3_outputs/example/da3_output.npz \
-    --estimate_camera_pose \
-    --camera_pose_mode manual_sync_time \
-    --pose_refine_steps 200 \
-    --overlay_pointmap \
-    --merge_da3_glb \
-    --visualize_weights \
-    --entropy_alpha 30.0
 ```
 
 ### Using Visibility Weighting
@@ -455,15 +320,8 @@ python run_inference_weighted.py \
 - `params.npz`: Parameter file (contains pose, scale, etc.)
 - `inference.log`: Inference log
 
-### Camera Pose Estimation Output
-- `estimated_poses.json`: Object pose and camera pose for all views
-- `result_with_cameras.glb`: Visualization with object and camera frustums
-- `camera_pose_evaluation.json`: Comparison metrics against DA3 GT (if available)
-- `result_cameras_aligned_with_gt.glb`: Visualization comparing aligned estimated poses with GT poses
-
 ### Overlay Visualization Output
 - `result_overlay.glb`: SAM3D result overlaid on View 0 point cloud
-- `result_overlay_view{i}.glb`: Overlay result for each view (if camera pose estimation enabled with mode `independent`）
 
 ### Merged Scene Output
 - `result_merged_scene.glb`: SAM3D object merged with DA3 scene
@@ -477,36 +335,19 @@ python run_inference_weighted.py \
 
 ### Required Combinations
 1. `--merge_da3_glb` must be used with `--da3_output` 
-2. `--optimize_per_view_pose` requires `--da3_output` and contains valid extrinsics
-3. `--estimate_camera_pose` recommended to use with `--da3_output` （for evaluation）
-4. `--weight_source visibility` or `--weight_source mixed` **must be used** with  `--da3_output` 
-5. `--weight_combine_mode`  and  `--visibility_weight_ratio` Only applies when `--weight_source mixed` 
+2. `--weight_source visibility` or `--weight_source mixed` **must be used** with `--da3_output` 
+3. `--weight_combine_mode` and `--visibility_weight_ratio` only apply when `--weight_source mixed`
 
 ### Recommended Combinations
-1. High quality reconstruction：`--da3_output` + `--entropy_alpha 30.0`
-2. Camera pose estimation：`--estimate_camera_pose` + `--da3_output` + `--overlay_pointmap`
-3. Full analysis: Enable all visualization options + weight visualization
-4. Visibility weighting：`--weight_source visibility` + `--da3_output` + `--visibility_threshold 0.1`
-5. Mixed weighting：`--weight_source mixed` + `--da3_output` + `--visibility_weight_ratio 0.5`
+1. High quality reconstruction: `--da3_output` + `--entropy_alpha 30.0`
+2. Visibility weighting: `--weight_source visibility` + `--da3_output`
+3. Mixed weighting: `--weight_source mixed` + `--da3_output` + `--visibility_weight_ratio 0.5`
 
 ---
 
 ## FAQ
 
-### Q: Which one should I use `camera_pose_mode`？
-A: 
-- **Quick testing**: `fixed_shape`
-- **Strict shape consistency required**: `manual_sync_time`
-- **Balance quality and flexibility**: `mixed_update`
-- **Comparison experiments**: `independent`
-
-### Q: `pose_refine_steps` How to set？
-A: 
-- **Default**: 50 steps usually sufficient
-- **Better quality**: 100-200  steps
-- **Time sensitive**: try 30-50  steps
-
-### Q: `entropy_alpha` How to tune？
+### Q: `entropy_alpha` How to tune?
 A:
 - **Default**: 30.0（recommended starting point）
 - **Results too sparse**: lower to  20.0 or 10.0
@@ -528,14 +369,9 @@ A:
 
 ## Changelog
 
-- **2025-12-04**: 
-  - Added multiple weight source support：`--weight_source` parameter
-  - Added visibility weight parameters：`--visibility_alpha`, `--visibility_threshold`
-  - Added mixed mode parameters：`--weight_combine_mode`, `--visibility_weight_ratio`
-  - Updated Parameter Dependencies and Usage Examples
-
-- **2025-12-03**: 
-  - Added `mixed_update` mode (fixed increment version)
-  - Cleaned up unused modes（`progressive_fix`, `warm_start_time`, `co_evolve_weak`）
-  - Result folder naming now includes camera pose estimation related parameters
+- **2025-12-05**: 
+  - Added visibility-based weighting using self-occlusion detection
+  - Added `--weight_source` parameter: `entropy`, `visibility`, `mixed`
+  - Added `--self_occlusion_tolerance` for DDA ray tracing
+  - Cleaned up experimental camera pose estimation features
 

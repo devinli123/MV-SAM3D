@@ -140,8 +140,6 @@ python run_inference_weighted.py \
 | `--visualize_weights` | Visualize fusion weights | False |
 | `--compute_latent_visibility` | Visualize latent visibility per view | False |
 
-> ⚠️ **Known Issue**: Camera pose estimation (`--estimate_camera_pose`) is currently experimental and may produce inaccurate results. The GT camera poses from DA3 work correctly.
-
 📖 **Full Parameters**: See [README_PARAMETERS.md](README_PARAMETERS.md) for detailed parameter documentation.
 
 ### Data Structure
