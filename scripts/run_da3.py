@@ -166,10 +166,14 @@ def project_global_pointcloud_to_view(
     x_img = (points_cam[:, 0] * fx / points_cam[:, 2]) + cx
     y_img = (points_cam[:, 1] * fy / points_cam[:, 2]) + cy
 
-    # Filter points within image bounds
-    in_bounds = (x_img >= 0) & (x_img < W) & (y_img >= 0) & (y_img < H)
-    x_img = x_img[in_bounds]
-    y_img = y_img[in_bounds]
+    # Round to nearest pixel first
+    u = np.round(x_img).astype(int)
+    v = np.round(y_img).astype(int)
+
+    # Filter points within image bounds (AFTER rounding to avoid edge cases)
+    in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    u = u[in_bounds]
+    v = v[in_bounds]
     points_cam = points_cam[in_bounds]
 
     if len(points_cam) == 0:
@@ -180,10 +184,6 @@ def project_global_pointcloud_to_view(
     # Initialize with zeros
     pointmap = np.zeros((H, W, 3), dtype=np.float32)
     depth_buffer = np.full((H, W), np.inf, dtype=np.float32)
-
-    # Round to nearest pixel
-    u = np.round(x_img).astype(int)
-    v = np.round(y_img).astype(int)
 
     # For each projected point, keep the closest one (depth test)
     for i in range(len(points_cam)):
