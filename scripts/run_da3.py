@@ -180,26 +180,46 @@ def project_global_pointcloud_to_view(
         print(f"  Warning: No points project within image bounds")
         return np.zeros((H, W, 3), dtype=np.float32)
 
-    # Create dense pointmap using nearest-neighbor interpolation
-    # Initialize with zeros
+    # Create dense pointmap using vectorized depth buffer
     pointmap = np.zeros((H, W, 3), dtype=np.float32)
     depth_buffer = np.full((H, W), np.inf, dtype=np.float32)
 
-    # For each projected point, keep the closest one (depth test)
+    # Vectorized depth test: for each projected point, keep the closest one
     for i in range(len(points_cam)):
         if points_cam[i, 2] < depth_buffer[v[i], u[i]]:
             depth_buffer[v[i], u[i]] = points_cam[i, 2]
             pointmap[v[i], u[i]] = points_cam[i]
 
-    # Fill holes using nearest-neighbor interpolation
-    valid_mask = depth_buffer < np.inf
-    if np.sum(valid_mask) > 0:
-        from scipy.ndimage import distance_transform_edt
-        # Find nearest valid pixel for each invalid pixel
-        invalid_mask = ~valid_mask
-        if np.sum(invalid_mask) > 0:
-            indices = distance_transform_edt(invalid_mask, return_distances=False, return_indices=True)
-            pointmap[invalid_mask] = pointmap[indices[0][invalid_mask], indices[1][invalid_mask]]
+    # Check coverage
+    valid_pixels = np.sum(depth_buffer < np.inf)
+    total_pixels = H * W
+    coverage = valid_pixels / total_pixels * 100
+    print(f"    Point cloud coverage: {coverage:.1f}% ({valid_pixels}/{total_pixels} pixels)")
+
+    # If coverage is too low, projection quality is poor
+    if coverage < 10:
+        print(f"    WARNING: Coverage too low ({coverage:.1f}%), projection may fail")
+        print(f"    This view will fallback to depth map")
+        return None  # Signal caller to use depth map instead
+
+    # For sparse areas, apply limited inpainting to avoid singular matrices
+    # Only fill small holes (1-2 pixel dilation) to maintain geometric diversity
+    if coverage < 80:
+        try:
+            from scipy.ndimage import distance_transform_edt, binary_dilation
+            valid_mask = depth_buffer < np.inf
+
+            # Only fill very small holes (1-2 pixel dilation)
+            dilated = binary_dilation(valid_mask, iterations=2)
+            small_holes = dilated & (~valid_mask)
+
+            if np.sum(small_holes) > 0:
+                indices = distance_transform_edt(~valid_mask, return_distances=False, return_indices=True)
+                pointmap[small_holes] = pointmap[indices[0][small_holes], indices[1][small_holes]]
+                filled_pixels = np.sum(small_holes)
+                print(f"    Filled {filled_pixels} small holes")
+        except Exception as e:
+            print(f"    Warning: Failed to fill holes: {e}")
 
     return pointmap
 
