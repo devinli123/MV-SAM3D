@@ -9,12 +9,20 @@ This script runs DA3 on a folder of images and outputs:
 
 The outputs can be used as input to MV-SAM3D for improved 3D reconstruction.
 
+IMPORTANT: By default, this script now uses the GLOBAL point cloud from scene.glb
+for all views, ensuring geometric consistency across views. This provides higher
+quality pointmaps compared to per-view depth maps.
+
 Usage:
+    # Default: Use global point cloud from scene.glb (RECOMMENDED)
     python scripts/run_da3.py --image_dir ./data/example/images --output_dir ./da3_outputs/example
-    
+
+    # Legacy mode: Use per-view depth maps (NOT recommended)
+    python scripts/run_da3.py --image_dir ./data/example/images --output_dir ./da3_outputs/example --no_global_pointcloud
+
     # With custom resolution
     python scripts/run_da3.py --image_dir ./data/example/images --output_dir ./da3_outputs/example --process_res 756
-    
+
     # Without visualization (faster)
     python scripts/run_da3.py --image_dir ./data/example/images --output_dir ./da3_outputs/example --no_vis
 """
@@ -92,15 +100,158 @@ def depth_to_pointmap(
 def pointmap_to_sam3d_format(pointmap: np.ndarray) -> np.ndarray:
     """
     Convert pointmap to SAM3D expected format.
-    
+
     Args:
         pointmap: (H, W, 3) pointmap in PyTorch3D coordinates
-        
+
     Returns:
         pointmap_sam3d: (3, H, W) pointmap ready for SAM3D
     """
     # SAM3D expects (3, H, W) format (channel-first)
     return pointmap.transpose(2, 0, 1)  # (H, W, 3) -> (3, H, W)
+
+
+def project_global_pointcloud_to_view(
+    global_points: np.ndarray,
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    image_shape: tuple,
+    use_global_pointcloud: bool = True,
+) -> np.ndarray:
+    """
+    Project global point cloud to a specific view's camera space, generating a dense pointmap.
+
+    This function takes the high-quality global point cloud from DA3's scene.glb and projects
+    it into each view's camera space, ensuring all views share the same geometric representation.
+
+    Args:
+        global_points: (M, 3) global point cloud in world coordinates
+        extrinsic: (3, 4) or (4, 4) camera extrinsic matrix (world-to-camera)
+        intrinsic: (3, 3) camera intrinsic matrix
+        image_shape: (H, W) target image shape
+        use_global_pointcloud: If True, use global points; if False, return None
+
+    Returns:
+        pointmap: (H, W, 3) dense pointmap in camera space, or None if disabled
+    """
+    if not use_global_pointcloud or global_points is None:
+        return None
+
+    H, W = image_shape
+
+    # Convert extrinsic to (4, 4) if needed
+    if extrinsic.shape == (3, 4):
+        extrinsic_4x4 = np.vstack([extrinsic, [0, 0, 0, 1]])
+    else:
+        extrinsic_4x4 = extrinsic
+
+    # Transform points from world to camera space
+    # global_points: (M, 3), add homogeneous coordinate
+    points_homo = np.hstack([global_points, np.ones((global_points.shape[0], 1))])  # (M, 4)
+    points_cam_homo = (extrinsic_4x4 @ points_homo.T).T  # (M, 4)
+    points_cam = points_cam_homo[:, :3]  # (M, 3)
+
+    # Filter points behind camera
+    valid_mask = points_cam[:, 2] > 0
+    points_cam = points_cam[valid_mask]
+
+    if len(points_cam) == 0:
+        print(f"  Warning: No points in front of camera")
+        return np.zeros((H, W, 3), dtype=np.float32)
+
+    # Project to image plane
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+
+    x_img = (points_cam[:, 0] * fx / points_cam[:, 2]) + cx
+    y_img = (points_cam[:, 1] * fy / points_cam[:, 2]) + cy
+
+    # Filter points within image bounds
+    in_bounds = (x_img >= 0) & (x_img < W) & (y_img >= 0) & (y_img < H)
+    x_img = x_img[in_bounds]
+    y_img = y_img[in_bounds]
+    points_cam = points_cam[in_bounds]
+
+    if len(points_cam) == 0:
+        print(f"  Warning: No points project within image bounds")
+        return np.zeros((H, W, 3), dtype=np.float32)
+
+    # Create dense pointmap using nearest-neighbor interpolation
+    # Initialize with zeros
+    pointmap = np.zeros((H, W, 3), dtype=np.float32)
+    depth_buffer = np.full((H, W), np.inf, dtype=np.float32)
+
+    # Round to nearest pixel
+    u = np.round(x_img).astype(int)
+    v = np.round(y_img).astype(int)
+
+    # For each projected point, keep the closest one (depth test)
+    for i in range(len(points_cam)):
+        if points_cam[i, 2] < depth_buffer[v[i], u[i]]:
+            depth_buffer[v[i], u[i]] = points_cam[i, 2]
+            pointmap[v[i], u[i]] = points_cam[i]
+
+    # Fill holes using nearest-neighbor interpolation
+    valid_mask = depth_buffer < np.inf
+    if np.sum(valid_mask) > 0:
+        from scipy.ndimage import distance_transform_edt
+        # Find nearest valid pixel for each invalid pixel
+        invalid_mask = ~valid_mask
+        if np.sum(invalid_mask) > 0:
+            indices = distance_transform_edt(invalid_mask, return_distances=False, return_indices=True)
+            pointmap[invalid_mask] = pointmap[indices[0][invalid_mask], indices[1][invalid_mask]]
+
+    return pointmap
+
+
+def load_global_pointcloud_from_scene(scene_glb_path: Path) -> Optional[np.ndarray]:
+    """
+    Load global point cloud from DA3's scene.glb file.
+
+    Args:
+        scene_glb_path: Path to scene.glb
+
+    Returns:
+        points: (M, 3) global point cloud in world coordinates, or None if file doesn't exist
+    """
+    try:
+        import trimesh
+    except ImportError:
+        print("Warning: trimesh not installed, cannot load scene.glb")
+        return None
+
+    if not scene_glb_path.exists():
+        print(f"Warning: scene.glb not found at {scene_glb_path}")
+        return None
+
+    print(f"Loading global point cloud from {scene_glb_path}")
+    scene = trimesh.load(str(scene_glb_path))
+
+    # Extract point cloud from scene
+    # scene.glb typically contains a point cloud as a mesh or points
+    if hasattr(scene, 'vertices'):
+        points = np.array(scene.vertices)
+    elif hasattr(scene, 'geometry'):
+        # It's a Scene object, extract all vertices
+        all_vertices = []
+        for geom in scene.geometry.values():
+            if hasattr(geom, 'vertices'):
+                all_vertices.append(np.array(geom.vertices))
+        if all_vertices:
+            points = np.vstack(all_vertices)
+        else:
+            print("Warning: No vertices found in scene.glb")
+            return None
+    else:
+        print("Warning: Unexpected scene.glb format")
+        return None
+
+    print(f"  Loaded {len(points)} points from scene.glb")
+    print(f"  Point cloud bounds: x=[{points[:, 0].min():.3f}, {points[:, 0].max():.3f}], "
+          f"y=[{points[:, 1].min():.3f}, {points[:, 1].max():.3f}], "
+          f"z=[{points[:, 2].min():.3f}, {points[:, 2].max():.3f}]")
+
+    return points
 
 
 def run_da3_inference(
@@ -110,10 +261,11 @@ def run_da3_inference(
     process_res: int = 504,
     save_visualization: bool = True,
     device: str = "cuda",
+    use_global_pointcloud: bool = True,
 ) -> Dict[str, Any]:
     """
     Run DA3 on a folder of images.
-    
+
     Args:
         image_dir: Path to folder containing input images
         output_dir: Path to output directory
@@ -121,11 +273,12 @@ def run_da3_inference(
         process_res: Processing resolution (default: 504)
         save_visualization: Whether to save GLB and depth visualizations
         device: Device to run on ('cuda' or 'cpu')
-    
+        use_global_pointcloud: Whether to use global point cloud from scene.glb for all views (default: True)
+
     Returns:
         Dictionary containing:
             - depth: (N, H, W) depth maps
-            - pointmaps: (N, H, W, 3) point cloud maps
+            - pointmaps: (N, H, W, 3) point cloud maps (from global scene if use_global_pointcloud=True)
             - extrinsics: (N, 3, 4) or (N, 4, 4) camera extrinsics
             - intrinsics: (N, 3, 3) camera intrinsics
             - image_files: List of input image paths
@@ -205,27 +358,73 @@ def run_da3_inference(
     print(f"  Depth range: [{depth.min():.4f}, {depth.max():.4f}]")
     print(f"  Extrinsics shape: {extrinsics.shape}")
     print(f"  Intrinsics shape: {intrinsics.shape}")
-    
+
+    # Load global point cloud from scene.glb if requested
+    N = depth.shape[0]
+    H, W = depth.shape[1], depth.shape[2]
+    global_points = None
+
+    if use_global_pointcloud:
+        print(f"\n{'='*60}")
+        print(f"Using GLOBAL point cloud from scene.glb for all views")
+        print(f"{'='*60}")
+        scene_glb_path = output_path / "scene.glb"
+
+        # Wait a bit for scene.glb to be written (DA3 writes it asynchronously)
+        import time
+        max_wait = 10
+        for i in range(max_wait):
+            if scene_glb_path.exists():
+                break
+            print(f"  Waiting for scene.glb to be generated... ({i+1}/{max_wait})")
+            time.sleep(1)
+
+        global_points = load_global_pointcloud_from_scene(scene_glb_path)
+
+        if global_points is None:
+            print(f"  WARNING: Failed to load global point cloud, falling back to per-view depth maps")
+            use_global_pointcloud = False
+    else:
+        print(f"\nUsing per-view depth maps (legacy mode)")
+
     # Convert depth to pointmaps
     # Two formats:
     # 1. pointmaps: (N, H, W, 3) - standard camera space, for visualization
     # 2. pointmaps_sam3d: (N, 3, H, W) - channel-first format for SAM3D input
-    # 
+    #
     # NOTE: We output in STANDARD CAMERA SPACE (z positive = away from camera)
     # SAM3D's compute_pointmap() applies the PyTorch3D transform internally
-    N = depth.shape[0]
     pointmaps = []
     pointmaps_sam3d = []
+
+    print(f"\nGenerating pointmaps for {N} views...")
     for i in range(N):
-        # Convert depth to pointmap (standard camera space, no coordinate transform)
-        pm = depth_to_pointmap(depth[i], intrinsics[i])
+        if use_global_pointcloud and global_points is not None:
+            # Project global point cloud to this view
+            print(f"  View {i+1}/{N}: Projecting global point cloud...")
+            pm = project_global_pointcloud_to_view(
+                global_points,
+                extrinsics[i],
+                intrinsics[i],
+                (H, W),
+                use_global_pointcloud=True
+            )
+            if pm is None:
+                # Fallback to depth map if projection failed
+                print(f"    Projection failed, using depth map instead")
+                pm = depth_to_pointmap(depth[i], intrinsics[i])
+        else:
+            # Legacy: Convert depth to pointmap (standard camera space, no coordinate transform)
+            pm = depth_to_pointmap(depth[i], intrinsics[i])
+
         pointmaps.append(pm)
         pointmaps_sam3d.append(pointmap_to_sam3d_format(pm))
-    
+
     pointmaps = np.stack(pointmaps, axis=0)  # (N, H, W, 3)
     pointmaps_sam3d = np.stack(pointmaps_sam3d, axis=0)  # (N, 3, H, W)
-    
-    print(f"  Pointmaps shape: {pointmaps.shape} (standard camera space)")
+
+    source_description = "from global scene.glb" if use_global_pointcloud else "from per-view depth maps"
+    print(f"\n  Pointmaps shape: {pointmaps.shape} (standard camera space, {source_description})")
     print(f"  Pointmaps SAM3D shape: {pointmaps_sam3d.shape} (channel-first for SAM3D)")
     print(f"  Z range: [{pointmaps[:, :, :, 2].min():.4f}, {pointmaps[:, :, :, 2].max():.4f}] (should be positive)")
     
@@ -234,19 +433,21 @@ def run_da3_inference(
     np.savez(
         output_file,
         depth=depth,                          # (N, H, W)
-        pointmaps=pointmaps,                  # (N, H, W, 3) - PyTorch3D coords, for visualization
+        pointmaps=pointmaps,                  # (N, H, W, 3) - from global scene or per-view depth
         pointmaps_sam3d=pointmaps_sam3d,      # (N, 3, H, W) - SAM3D format, ready to use
         extrinsics=extrinsics,                # (N, 3, 4) or (N, 4, 4)
         intrinsics=intrinsics,                # (N, 3, 3)
         image_files=np.array([str(f) for f in image_files]),
         process_res=process_res,
+        use_global_pointcloud=use_global_pointcloud,  # Flag to indicate source
     )
     print(f"\nResults saved to: {output_file}")
     print(f"  - depth: {depth.shape}")
-    print(f"  - pointmaps: {pointmaps.shape} (PyTorch3D coords, for visualization)")
+    print(f"  - pointmaps: {pointmaps.shape} ({source_description})")
     print(f"  - pointmaps_sam3d: {pointmaps_sam3d.shape} (SAM3D format, ready to use)")
     print(f"  - extrinsics: {extrinsics.shape}")
     print(f"  - intrinsics: {intrinsics.shape}")
+    print(f"  - use_global_pointcloud: {use_global_pointcloud}")
     
     # Print summary of camera poses
     print(f"\nCamera poses (first 3 views):")
@@ -275,12 +476,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Basic usage
+    # Basic usage (uses global point cloud from scene.glb - RECOMMENDED)
     python scripts/run_da3.py --image_dir ./data/example/images --output_dir ./da3_outputs/example
-    
+
+    # Legacy mode (uses per-view depth maps)
+    python scripts/run_da3.py --image_dir ./data/example/images --output_dir ./da3_outputs/example --no_global_pointcloud
+
     # Higher resolution
     python scripts/run_da3.py --image_dir ./data/example/images --output_dir ./da3_outputs/example --process_res 756
-    
+
     # Without visualization (faster)
     python scripts/run_da3.py --image_dir ./data/example/images --output_dir ./da3_outputs/example --no_vis
         """
@@ -321,9 +525,14 @@ Examples:
         default="cuda",
         help="Device to run on (default: cuda)"
     )
-    
+    parser.add_argument(
+        "--no_global_pointcloud",
+        action="store_true",
+        help="Disable global point cloud from scene.glb (use per-view depth maps instead)"
+    )
+
     args = parser.parse_args()
-    
+
     run_da3_inference(
         image_dir=args.image_dir,
         output_dir=args.output_dir,
@@ -331,6 +540,7 @@ Examples:
         process_res=args.process_res,
         save_visualization=not args.no_vis,
         device=args.device,
+        use_global_pointcloud=not args.no_global_pointcloud,
     )
 
 
