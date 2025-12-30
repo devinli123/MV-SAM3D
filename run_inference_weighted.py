@@ -2209,27 +2209,34 @@ def run_weighted_inference(
                 if object_pointcloud_global is not None:
                     logger.info(f"Successfully extracted {len(object_pointcloud_global)} object points")
 
-                    # Project global object pointcloud to view 0 as reference pointmap
-                    # This replaces the low-quality per-view pointmap with a consistent global reference
+                    # Project global object pointcloud to view 0 camera space for alignment
+                    # This provides a consistent geometric reference for all object alignments
                     logger.info(f"Projecting global object pointcloud to view 0 camera space...")
-                    reference_pointmap = project_pointcloud_to_camera(
+                    object_pointcloud_view0 = project_pointcloud_to_camera(
                         object_pointcloud_global,
                         da3_extrinsics[0],  # View 0 extrinsic
                         da3_intrinsics[0],  # View 0 intrinsic
                         (H, W),
                     )
 
-                    # Convert to torch and correct format (3, H, W)
-                    reference_pointmap_torch = torch.from_numpy(reference_pointmap).float().permute(2, 0, 1)  # (3, H, W)
+                    # Convert to torch (M, 3) format
+                    # Extract non-zero points (those that were successfully projected)
+                    nonzero_mask = np.any(object_pointcloud_view0 != 0, axis=-1)  # (H, W)
+                    object_points_camera = object_pointcloud_view0[nonzero_mask]  # (M, 3)
+                    object_pointcloud_camera_tensor = torch.from_numpy(object_points_camera).float()
 
-                    # Replace view_pointmaps[0] with this global-derived pointmap
-                    view_pointmaps[0] = reference_pointmap_torch.numpy()
-                    logger.info(f"  Replaced view 0 pointmap with global object pointmap")
-                    logger.info(f"  Reference pointmap shape: {reference_pointmap_torch.shape}")
+                    logger.info(f"  Projected {len(object_points_camera)} object points to view 0 camera space")
+                    logger.info(f"  Object point cloud shape: {object_pointcloud_camera_tensor.shape}")
                 else:
                     logger.warning("Failed to extract object point cloud from scene.glb")
+                    object_pointcloud_camera_tensor = None
             else:
                 logger.warning(f"scene.glb not found at {scene_glb_path}, cannot extract object point cloud")
+                object_pointcloud_camera_tensor = None
+        else:
+            object_pointcloud_camera_tensor = None
+    else:
+        object_pointcloud_camera_tensor = None
     
     is_single_view = num_views == 1
     
@@ -2431,6 +2438,18 @@ def run_weighted_inference(
     # Note: Weighting uses in-memory AttentionCollector, not CrossAttentionLogger
     # The attention for weight computation is collected directly during warmup pass
     
+    # Prepare pointmap with embedded object point cloud if available
+    pointmap_for_inference = None
+    if view_pointmaps is not None and len(view_pointmaps) > 0:
+        pointmap_for_inference = view_pointmaps[0]  # Use view 0 pointmap
+
+    # Inject object point cloud into pipeline via a custom mechanism
+    # We'll store it in the pipeline temporarily for compute_pointmap to access
+    if object_pointcloud_camera_tensor is not None:
+        logger.info("Passing object point cloud to pipeline for alignment")
+        # Temporarily store in pipeline instance
+        inference._pipeline._temp_object_pointcloud_camera = object_pointcloud_camera_tensor
+
     # Run inference
     if is_single_view:
         logger.info("Single-view inference mode")
@@ -2448,6 +2467,7 @@ def run_weighted_inference(
             stage2_inference_steps=stage2_steps,
             decode_formats=decode_formats,
             attention_logger=attention_logger,
+            pointmap=pointmap_for_inference,
         )
         weight_manager = None
     else:

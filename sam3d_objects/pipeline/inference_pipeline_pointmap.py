@@ -330,25 +330,66 @@ class InferencePipelinePointMap(InferencePipeline):
             )
             point_map_tensor["intrinsics"] = intrinsics_result["intrinsics"]
 
+        # Check if object point cloud is available (passed via temporary attribute)
+        if hasattr(self, '_temp_object_pointcloud_camera'):
+            point_map_tensor["object_pointcloud_camera"] = self._temp_object_pointcloud_camera
+            logger.info(f"Embedded object point cloud in pointmap_dict: {self._temp_object_pointcloud_camera.shape}")
+
         return point_map_tensor
 
-    def run_post_optimization(self, mesh_glb, intrinsics, pose_dict, layout_input_dict):
+    def run_post_optimization(self, mesh_glb, intrinsics, pose_dict, layout_input_dict, object_pointcloud_camera=None):
+        """
+        Run post-optimization alignment.
+
+        Args:
+            mesh_glb: Mesh to align
+            intrinsics: Camera intrinsics
+            pose_dict: Initial pose dictionary
+            layout_input_dict: Input data dictionary (may contain rgb_pointmap)
+            object_pointcloud_camera: (Optional) Pre-extracted object point cloud in camera space.
+                                     If provided, uses point cloud-based alignment instead of pointmap.
+
+        Returns:
+            Dictionary with refined pose and IOU
+        """
         intrinsics = intrinsics.clone()
         fx, fy = intrinsics[0, 0], intrinsics[1, 1]
         re_focal = min(fx, fy)
         intrinsics[0, 0], intrinsics[1, 1] = re_focal, re_focal
-        revised_quat, revised_t, revised_scale, final_iou, _, _ = (
-            self.layout_post_optimization_method(
-                mesh_glb,
-                pose_dict["rotation"],
-                pose_dict["translation"],
-                pose_dict["scale"],
-                layout_input_dict["rgb_image_mask"][0, 0],
-                layout_input_dict["rgb_pointmap"][0].permute(1, 2, 0),
-                intrinsics,
-                min_size=518,
+
+        # Use point cloud-based alignment if object point cloud is provided
+        if object_pointcloud_camera is not None:
+            from sam3d_objects.pipeline.layout_post_optimization_utils import layout_post_optimization_with_pointcloud
+
+            logger.info("Using point cloud-based alignment (bypassing pointmap)")
+            revised_quat, revised_t, revised_scale, final_iou, _, _ = (
+                layout_post_optimization_with_pointcloud(
+                    mesh_glb,
+                    pose_dict["rotation"],
+                    pose_dict["translation"],
+                    pose_dict["scale"],
+                    layout_input_dict["rgb_image_mask"][0, 0],
+                    object_pointcloud_camera,  # Use pre-extracted point cloud
+                    intrinsics,
+                    min_size=518,
+                )
             )
-        )
+        else:
+            # Legacy: use pointmap-based alignment
+            logger.info("Using pointmap-based alignment (legacy)")
+            revised_quat, revised_t, revised_scale, final_iou, _, _ = (
+                self.layout_post_optimization_method(
+                    mesh_glb,
+                    pose_dict["rotation"],
+                    pose_dict["translation"],
+                    pose_dict["scale"],
+                    layout_input_dict["rgb_image_mask"][0, 0],
+                    layout_input_dict["rgb_pointmap"][0].permute(1, 2, 0),
+                    intrinsics,
+                    min_size=518,
+                )
+            )
+
         return {
             "rotation": revised_quat,
             "translation": revised_t,
@@ -455,11 +496,16 @@ class InferencePipelinePointMap(InferencePipeline):
                 ):
                     assert glb is not None, "require mesh to run postprocessing"
                     logger.info("Running layout post optimization method...")
+
+                    # Check if object point cloud is available (passed via pointmap_dict)
+                    object_pointcloud_camera = pointmap_dict.get("object_pointcloud_camera", None)
+
                     postprocessed_pose = self.run_post_optimization(
                         deepcopy(glb),
                         pointmap_dict["intrinsics"],
                         ss_return_dict,
                         ss_input_dict,
+                        object_pointcloud_camera=object_pointcloud_camera,
                     )
                     ss_return_dict.update(postprocessed_pose)
             except Exception as e:

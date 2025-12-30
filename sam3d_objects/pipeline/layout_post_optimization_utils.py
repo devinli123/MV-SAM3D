@@ -298,6 +298,239 @@ def set_seed(seed=100):
     torch.backends.cudnn.benchmark = False
 
 
+def layout_post_optimization_with_pointcloud(
+    Mesh,
+    Quaternion,
+    Translation,
+    Scale,
+    Mask,
+    object_pointcloud_camera: torch.Tensor,  # (M, 3) object points in view 0 camera space
+    Intrinsics,
+    Enable_shape_ICP=True,
+    Enable_rendering_optimization=True,
+    min_size=512,
+    device=None,
+):
+    """
+    Layout post-optimization using pre-extracted object point cloud.
+
+    This function bypasses pointmap generation and directly uses the global
+    object point cloud for alignment. This ensures all objects share the same
+    geometric reference.
+
+    Args:
+        Mesh: Mesh object to align
+        Quaternion: Initial rotation quaternion
+        Translation: Initial translation
+        Scale: Initial scale
+        Mask: Object mask
+        object_pointcloud_camera: (M, 3) object point cloud in view 0 camera space
+        Intrinsics: Camera intrinsics
+        Enable_shape_ICP: Whether to run ICP alignment
+        Enable_rendering_optimization: Whether to run rendering optimization
+        min_size: Minimum size for rendering
+        device: Device to use
+
+    Returns:
+        Tuple of (quaternion, translation, scale, iou, flag_icp, flag_optim)
+    """
+    from pytorch3d.transforms import quaternion_to_matrix, matrix_to_quaternion, Transform3d
+    from pytorch3d.structures import Meshes
+    from sam3d_objects.data.dataset.tdfy.transforms_3d import compose_transform
+
+    set_seed(100)
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # Ensure object_pointcloud_camera is on the correct device
+    if object_pointcloud_camera is not None:
+        object_pointcloud_camera = object_pointcloud_camera.to(device)
+
+    # init transform and process mesh
+    Rotation = quaternion_to_matrix(Quaternion.squeeze(1))
+    center = Translation[0].clone()
+    tfm_ori = compose_transform(scale=Scale, rotation=Rotation, translation=Translation)
+    mesh, faces_idx, textures = get_mesh(Mesh, tfm_ori, device)
+
+    # get mask and renderer
+    mask, renderer = get_mask_renderer(Mask, min_size, Intrinsics, device)
+
+    # Check if we have valid object points
+    if object_pointcloud_camera is None or len(object_pointcloud_camera) == 0:
+        logger.warning("No object point cloud provided, returning original pose")
+        return (
+            Quaternion,
+            Translation,
+            Scale,
+            -1.0,
+            False,
+            False,
+        )
+
+    # Use object point cloud directly as target points (already in camera space)
+    target_points = object_pointcloud_camera
+
+    # Filter outliers using quantile
+    thresh = 0.9
+    if len(target_points) > 10:
+        depth_quantile = torch.quantile(target_points[:, 2], thresh)
+        target_points = target_points[target_points[:, 2] <= depth_quantile]
+
+    if len(target_points) < 10:
+        logger.warning(f"Too few target points ({len(target_points)}), returning original pose")
+        return (
+            Quaternion,
+            Translation,
+            Scale,
+            -1.0,
+            False,
+            False,
+        )
+
+    # Get source points from mesh
+    source_points = mesh.verts_packed()
+
+    # Step 1: Manual alignment based on height and center
+    height_src = torch.max(source_points[:, 1]) - torch.min(source_points[:, 1])
+    height_tgt = torch.max(target_points[:, 1]) - torch.min(target_points[:, 1])
+    scale_1 = height_tgt / height_src
+    source_points *= scale_1
+    center *= scale_1
+
+    center_src = torch.mean(source_points, dim=0)
+    center_tgt = torch.mean(target_points, dim=0)
+    translation_1 = center_tgt - center_src
+
+    source_points += translation_1
+    center += translation_1
+
+    # Apply manual alignment
+    tfm1 = (
+        Transform3d(device=device)
+        .scale(scale_1.expand(3)[None])
+        .translate(translation_1[None])
+    )
+    mesh = Meshes(verts=[source_points], faces=[faces_idx], textures=textures)
+    rendered = renderer(mesh)
+    ori_iou = compute_iou(rendered[..., 3][0][None, None], mask, threshold=0.5)
+    final_iou = ori_iou.cpu().item()
+
+    logger.info(f"Manual alignment IOU: {final_iou:.4f}")
+
+    # Step 2: Shape ICP
+    Flag_ICP = False
+    if Enable_shape_ICP and len(target_points) >= 10:
+        try:
+            points_aligned_icp, transformation = run_ICP(
+                mesh, source_points, target_points, threshold=0.05
+            )
+            mesh_ICP = Meshes(
+                verts=[points_aligned_icp], faces=[faces_idx], textures=textures
+            )
+            rendered = renderer(mesh_ICP)
+            ori_iou_shapeICP = compute_iou(
+                rendered[..., 3][0][None, None], mask, threshold=0.5
+            )
+            # determine whether accept ICP
+            if ori_iou_shapeICP > ori_iou:
+                Flag_ICP = True
+                mesh = mesh_ICP
+                final_iou = ori_iou_shapeICP.cpu().item()
+                T_o3d = torch.tensor(transformation, dtype=torch.float32, device=device)
+                T_o3d = T_o3d.T
+                A = T_o3d[:3, :3]
+                t = T_o3d[3, :3]
+                scale = A.norm(dim=1)
+                R = A / scale[:, None]
+                center = ((center[None] * scale) @ R + t)[0]  # transform center
+                tfm2 = (
+                    Transform3d(device=device)
+                    .scale(scale[None])
+                    .rotate(R[None])
+                    .translate(t[None])
+                )
+                logger.info(f"ICP alignment IOU: {final_iou:.4f} (accepted)")
+            else:
+                scale_2 = torch.tensor(1.0, device=device)
+                translation_2 = torch.zeros(3, device=device)
+                tfm2 = (
+                    Transform3d(device=device)
+                    .scale(scale_2.expand(3)[None])
+                    .translate(translation_2[None])
+                )
+                logger.info(f"ICP alignment IOU: {ori_iou_shapeICP.cpu().item():.4f} (rejected)")
+        except Exception as e:
+            logger.warning(f"ICP failed: {e}")
+            scale_2 = torch.tensor(1.0, device=device)
+            translation_2 = torch.zeros(3, device=device)
+            tfm2 = (
+                Transform3d(device=device)
+                .scale(scale_2.expand(3)[None])
+                .translate(translation_2[None])
+            )
+    else:
+        scale_2 = torch.tensor(1.0, device=device)
+        translation_2 = torch.zeros(3, device=device)
+        tfm2 = (
+            Transform3d(device=device)
+            .scale(scale_2.expand(3)[None])
+            .translate(translation_2[None])
+        )
+
+    # Step 3: Render-and-Compare optimization (optional)
+    Flag_optim = False
+    if Enable_rendering_optimization:
+        try:
+            quat, translation, scale, R = run_render_compare(
+                mesh, center, renderer, mask, device
+            )
+            with torch.no_grad():
+                transformed = apply_transform(mesh, center, quat, translation, scale)
+                rendered = renderer(transformed)
+            optimized_iou = compute_iou(
+                rendered[..., 3][0][None, None], mask, threshold=0.5
+            )
+            # Accept if better IOU
+            if optimized_iou > ori_iou:
+                Flag_optim = True
+                final_iou = optimized_iou.cpu().item()
+                tfm3 = (
+                    Transform3d(device=device)
+                    .scale(scale[None])
+                    .rotate(R[None])
+                    .translate(translation[None])
+                )
+                logger.info(f"Render optimization IOU: {final_iou:.4f} (accepted)")
+            else:
+                tfm3 = Transform3d(device=device)
+                logger.info(f"Render optimization IOU: {optimized_iou.cpu().item():.4f} (rejected)")
+        except Exception as e:
+            logger.warning(f"Render optimization failed: {e}")
+            tfm3 = Transform3d(device=device)
+    else:
+        tfm3 = Transform3d(device=device)
+
+    # Compose all transformations
+    tfm = tfm_ori.compose(tfm1).compose(tfm2).compose(tfm3)
+
+    # Extract final pose
+    M = tfm.get_matrix()[0]
+    A = M[:3, :3]
+    t = M[3, :3]
+    scale_final = A.norm(dim=1)
+    R_final = A / scale_final[:, None]
+    quat_final = matrix_to_quaternion(R_final[None])
+
+    return (
+        quat_final,
+        t[None],
+        scale_final,
+        final_iou,
+        Flag_ICP,
+        Flag_optim,
+    )
+
+
 def load_and_simplify_mesh(Mesh, device, target_triangles=5000):
 
     vertices = np.asarray(Mesh.vertices)
