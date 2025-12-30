@@ -274,6 +274,165 @@ def load_global_pointcloud_from_scene(scene_glb_path: Path) -> Optional[np.ndarr
     return points
 
 
+def extract_object_pointcloud_from_scene(
+    scene_glb_path: Path,
+    view_masks: List[np.ndarray],
+    extrinsics: np.ndarray,
+    intrinsics: np.ndarray,
+    image_shape: tuple,
+) -> Optional[np.ndarray]:
+    """
+    Extract object point cloud from DA3's scene.glb using masks from multiple views.
+
+    This function projects the global point cloud to each view, checks which points
+    are inside any mask, and returns those points in world coordinates.
+
+    Args:
+        scene_glb_path: Path to scene.glb
+        view_masks: List of (H, W) binary masks, one per view
+        extrinsics: (N, 3, 4) or (N, 4, 4) camera extrinsics
+        intrinsics: (N, 3, 3) camera intrinsics
+        image_shape: (H, W) image shape
+
+    Returns:
+        object_points: (M, 3) object point cloud in world coordinates, or None if failed
+    """
+    # Load global point cloud
+    global_points = load_global_pointcloud_from_scene(scene_glb_path)
+    if global_points is None:
+        return None
+
+    H, W = image_shape
+    N = len(view_masks)
+
+    print(f"\nExtracting object point cloud from {N} views...")
+    object_point_mask = np.zeros(len(global_points), dtype=bool)
+
+    for i in range(N):
+        mask = view_masks[i]
+        extrinsic = extrinsics[i]
+        intrinsic = intrinsics[i]
+
+        # Convert extrinsic to (4, 4)
+        if extrinsic.shape == (3, 4):
+            extrinsic_4x4 = np.vstack([extrinsic, [0, 0, 0, 1]])
+        else:
+            extrinsic_4x4 = extrinsic
+
+        # Transform points from world to camera space
+        points_homo = np.hstack([global_points, np.ones((global_points.shape[0], 1))])
+        points_cam_homo = (extrinsic_4x4 @ points_homo.T).T
+        points_cam = points_cam_homo[:, :3]
+
+        # Filter points in front of camera
+        front_mask = points_cam[:, 2] > 0
+
+        # Project to image plane
+        fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+        cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+
+        x_img = (points_cam[:, 0] * fx / points_cam[:, 2]) + cx
+        y_img = (points_cam[:, 1] * fy / points_cam[:, 2]) + cy
+
+        # Round to pixel coordinates
+        u = np.round(x_img).astype(int)
+        v = np.round(y_img).astype(int)
+
+        # Check which points are in bounds
+        in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H) & front_mask
+
+        # For points in bounds, check if they're inside the mask
+        valid_indices = np.where(in_bounds)[0]
+        for idx in valid_indices:
+            if mask[v[idx], u[idx]] > 0.5:  # Inside mask
+                object_point_mask[idx] = True
+
+        visible_count = np.sum(in_bounds)
+        mask_count = np.sum(object_point_mask)
+        print(f"  View {i+1}/{N}: {visible_count} points visible, {mask_count} total in object")
+
+    # Extract object points
+    object_points = global_points[object_point_mask]
+
+    if len(object_points) == 0:
+        print("  WARNING: No points found inside any mask!")
+        return None
+
+    print(f"\n  Extracted {len(object_points)} object points from scene.glb")
+    print(f"  Object bounds: x=[{object_points[:, 0].min():.3f}, {object_points[:, 0].max():.3f}], "
+          f"y=[{object_points[:, 1].min():.3f}, {object_points[:, 1].max():.3f}], "
+          f"z=[{object_points[:, 2].min():.3f}, {object_points[:, 2].max():.3f}]")
+
+    return object_points
+
+
+def project_pointcloud_to_camera(
+    world_points: np.ndarray,
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    image_shape: tuple,
+) -> np.ndarray:
+    """
+    Project world-space point cloud to a specific camera's image plane to create a pointmap.
+
+    Args:
+        world_points: (M, 3) points in world coordinates
+        extrinsic: (3, 4) or (4, 4) camera extrinsic matrix (world-to-camera)
+        intrinsic: (3, 3) camera intrinsic matrix
+        image_shape: (H, W) target image shape
+
+    Returns:
+        pointmap: (H, W, 3) pointmap in camera space
+    """
+    H, W = image_shape
+
+    # Convert extrinsic to (4, 4)
+    if extrinsic.shape == (3, 4):
+        extrinsic_4x4 = np.vstack([extrinsic, [0, 0, 0, 1]])
+    else:
+        extrinsic_4x4 = extrinsic
+
+    # Transform from world to camera space
+    points_homo = np.hstack([world_points, np.ones((world_points.shape[0], 1))])
+    points_cam_homo = (extrinsic_4x4 @ points_homo.T).T
+    points_cam = points_cam_homo[:, :3]
+
+    # Filter points in front of camera
+    front_mask = points_cam[:, 2] > 0
+    points_cam = points_cam[front_mask]
+
+    if len(points_cam) == 0:
+        return np.zeros((H, W, 3), dtype=np.float32)
+
+    # Project to image plane
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+
+    x_img = (points_cam[:, 0] * fx / points_cam[:, 2]) + cx
+    y_img = (points_cam[:, 1] * fy / points_cam[:, 2]) + cy
+
+    # Round to pixel coordinates
+    u = np.round(x_img).astype(int)
+    v = np.round(y_img).astype(int)
+
+    # Filter points within bounds
+    in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    u = u[in_bounds]
+    v = v[in_bounds]
+    points_cam = points_cam[in_bounds]
+
+    # Create pointmap with depth buffering
+    pointmap = np.zeros((H, W, 3), dtype=np.float32)
+    depth_buffer = np.full((H, W), np.inf, dtype=np.float32)
+
+    for i in range(len(points_cam)):
+        if points_cam[i, 2] < depth_buffer[v[i], u[i]]:
+            depth_buffer[v[i], u[i]] = points_cam[i, 2]
+            pointmap[v[i], u[i]] = points_cam[i]
+
+    return pointmap
+
+
 def run_da3_inference(
     image_dir: str,
     output_dir: str,

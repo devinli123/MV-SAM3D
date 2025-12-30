@@ -60,6 +60,10 @@ from sam3d_objects.utils.coordinate_transforms import (
 )
 from pytorch3d.transforms import Transform3d, quaternion_to_matrix
 
+# Import DA3 utilities
+sys.path.append("scripts")
+from run_da3 import extract_object_pointcloud_from_scene, project_pointcloud_to_camera
+
 
 def merge_glb_with_da3_aligned(
     sam3d_glb_path: Path, 
@@ -2168,8 +2172,64 @@ def run_weighted_inference(
             da3_extrinsics = np.array(matched_da3_extrinsics)
         if matched_da3_intrinsics:
             da3_intrinsics = np.array(matched_da3_intrinsics)
-        
+
         logger.info(f"  Successfully loaded and matched {len(view_pointmaps)} external pointmaps from DA3")
+
+        # Extract global object point cloud from scene.glb using all view masks
+        # This provides a consistent geometric reference for alignment
+        object_pointcloud_global = None
+        if da3_extrinsics is not None and da3_intrinsics is not None:
+            scene_glb_path = da3_dir / "scene.glb"
+            if scene_glb_path.exists():
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Extracting object point cloud from scene.glb")
+                logger.info(f"{'='*60}")
+
+                # Prepare masks (convert from PIL to numpy if needed)
+                view_masks_np = []
+                for mask in view_masks:
+                    if hasattr(mask, 'convert'):  # PIL Image
+                        mask_np = np.array(mask.convert('L')) / 255.0
+                    else:
+                        mask_np = np.array(mask)
+                    view_masks_np.append(mask_np)
+
+                # Get image shape from first mask
+                H, W = view_masks_np[0].shape
+
+                # Extract object points from global scene
+                object_pointcloud_global = extract_object_pointcloud_from_scene(
+                    scene_glb_path,
+                    view_masks_np,
+                    da3_extrinsics,
+                    da3_intrinsics,
+                    (H, W),
+                )
+
+                if object_pointcloud_global is not None:
+                    logger.info(f"Successfully extracted {len(object_pointcloud_global)} object points")
+
+                    # Project global object pointcloud to view 0 as reference pointmap
+                    # This replaces the low-quality per-view pointmap with a consistent global reference
+                    logger.info(f"Projecting global object pointcloud to view 0 camera space...")
+                    reference_pointmap = project_pointcloud_to_camera(
+                        object_pointcloud_global,
+                        da3_extrinsics[0],  # View 0 extrinsic
+                        da3_intrinsics[0],  # View 0 intrinsic
+                        (H, W),
+                    )
+
+                    # Convert to torch and correct format (3, H, W)
+                    reference_pointmap_torch = torch.from_numpy(reference_pointmap).float().permute(2, 0, 1)  # (3, H, W)
+
+                    # Replace view_pointmaps[0] with this global-derived pointmap
+                    view_pointmaps[0] = reference_pointmap_torch.numpy()
+                    logger.info(f"  Replaced view 0 pointmap with global object pointmap")
+                    logger.info(f"  Reference pointmap shape: {reference_pointmap_torch.shape}")
+                else:
+                    logger.warning("Failed to extract object point cloud from scene.glb")
+            else:
+                logger.warning(f"scene.glb not found at {scene_glb_path}, cannot extract object point cloud")
     
     is_single_view = num_views == 1
     
